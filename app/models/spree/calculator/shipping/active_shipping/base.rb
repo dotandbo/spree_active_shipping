@@ -9,24 +9,24 @@ module Spree
   module Calculator::Shipping
     module ActiveShipping
       class Base < ShippingCalculator
-        include ActiveMerchant::Shipping
+        include ActiveShipping
 
         def self.service_name
           self.description
         end
 
         def available?(package)
+          # helps the available? method determine
+          # if rates are avaiable for this service
+          # before calling the carrier for rates
+          is_package_shippable?(package)
+
           !compute(package).nil?
         rescue Spree::ShippingError
           false
         end
 
         def compute_package(package)
-          # helps the available? method determine
-          # if rates are avaiable for this service
-          # before calling the carrier for rates
-          is_package_shippable? package
-
           order = package.order
           stock_location = package.stock_location
 
@@ -49,12 +49,12 @@ module Spree
         def timing(line_items)
           order = line_items.first.order
           # TODO: Figure out where stock_location is supposed to come from.
-          origin= Location.new(:country => stock_location.country.iso,
+          origin= ::ActiveShipping::Location.new(:country => stock_location.country.iso,
                                :city => stock_location.city,
                                :state => (stock_location.state ? stock_location.state.abbr : stock_location.state_name),
                                :zip => stock_location.zipcode)
           addr = order.ship_address
-          destination = Location.new(:country => addr.country.iso,
+          destination = ::ActiveShipping::Location.new(:country => addr.country.iso,
                                      :state => (addr.state ? addr.state.abbr : addr.state_name),
                                      :city => addr.city,
                                      :zip => addr.zipcode)
@@ -89,8 +89,8 @@ module Spree
         # zero weight check means no check
         # nil check means service isn't available for that country
         def valid_weight_for_package? package, max_weight
-          return true if max_weight.zero?
           return false if max_weight.nil?
+          return true if max_weight.zero?
           package.weight <= max_weight
         end
 
@@ -104,9 +104,9 @@ module Spree
             end
             rate_hash = Hash[*rates.flatten]
             return rate_hash
-          rescue ActiveMerchant::ActiveMerchantError => e
+          rescue ::ActiveShipping::Error => e
 
-            if [ActiveMerchant::ResponseError, ActiveMerchant::Shipping::ResponseError].include?(e.class) && e.response.is_a?(ActiveMerchant::Shipping::Response)
+            if e.class == ::ActiveShipping::ResponseError && e.response.is_a?(::ActiveShipping::Response)
               params = e.response.params
               if params.has_key?("Response") && params["Response"].has_key?("Error") && params["Response"]["Error"].has_key?("ErrorDescription")
                 message = params["Response"]["Error"]["ErrorDescription"]
@@ -134,8 +134,8 @@ module Spree
               response = carrier.find_time_in_transit(origin, destination, packages)
               return response
             end
-          rescue ActiveMerchant::Shipping::ResponseError => re
-            if re.response.is_a?(ActiveMerchant::Shipping::Response)
+          rescue ::ActiveShipping::ResponseError => re
+            if re.response.is_a?(::ActiveShipping::Response)
               params = re.response.params
               if params.has_key?("Response") && params["Response"].has_key?("Error") && params["Response"]["Error"].has_key?("ErrorDescription")
                 message = params["Response"]["Error"]["ErrorDescription"]
@@ -162,28 +162,10 @@ module Spree
             item_weight = default_weight if item_weight <= 0
             item_weight *= multiplier
 
-            quantity = content_item.quantity
-            if max_weight <= 0
-              item_weight * quantity
-            elsif item_weight == 0
-              0
+            if max_weight <= 0 || item_weight < max_weight
+              item_weight
             else
-              if item_weight < max_weight
-                max_quantity = (max_weight/item_weight).floor
-                if quantity < max_quantity
-                  item_weight * quantity
-                else
-                  new_items = []
-                  while quantity > 0 do
-                    new_quantity = [max_quantity, quantity].min
-                    new_items << (item_weight * new_quantity)
-                    quantity -= new_quantity
-                  end
-                  new_items
-                end
-              else
-                raise Spree::ShippingError.new("#{I18n.t(:shipping_error)}: The maximum per package weight for the selected service from the selected country is #{max_weight} ounces.")
-              end
+              raise Spree::ShippingError.new("#{I18n.t(:shipping_error)}: The maximum per package weight for the selected service from the selected country is #{max_weight} ounces.")  
             end
           end
           weights.flatten.compact.sort
@@ -213,40 +195,31 @@ module Spree
           packages
         end
 
-        # Used for calculating Dimensional Weight pricing.
-        # Override in your own extensions to compute package dimensions,
-        # or just leave this alone to keep the default behavior.
-        # Sample output: [9, 6, 3]
-        def convert_package_to_dimensions_array(package)
-          []
-        end
-
         # Generates an array of Package objects based on the quantities and weights of the variants in the line items
         def packages(package)
           units = Spree::ActiveShipping::Config[:units].to_sym
           packages = []
           weights = convert_package_to_weights_array(package)
           max_weight = get_max_weight(package)
-          dimensions = convert_package_to_dimensions_array(package)
           item_specific_packages = convert_package_to_item_packages_array(package)
 
           if max_weight <= 0
-            packages << Package.new(weights.sum, dimensions, :units => units)
+            packages << ::ActiveShipping::Package.new(weights.sum, [], :units => units)
           else
             package_weight = 0
             weights.each do |content_weight|
               if package_weight + content_weight <= max_weight
                 package_weight += content_weight
               else
-                packages << Package.new(package_weight, dimensions, :units => units)
+                packages << ::ActiveShipping::Package.new(package_weight, [], :units => units)
                 package_weight = content_weight
               end
             end
-            packages << Package.new(package_weight, dimensions, :units => units) if package_weight > 0
+            packages << ::ActiveShipping::Package.new(package_weight, [], :units => units) if package_weight > 0
           end
 
           item_specific_packages.each do |package|
-            packages << Package.new(package.at(0), [package.at(1), package.at(2), package.at(3)], :units => :imperial)
+            packages << ::ActiveShipping::Package.new(package.at(0), [package.at(1), package.at(2), package.at(3)], :units => :imperial)
           end
 
           packages
@@ -278,7 +251,7 @@ module Spree
         end
 
         def build_location address
-          Location.new(:country => address.country.iso,
+          ::ActiveShipping::Location.new(:country => address.country.iso,
                        :state   => fetch_best_state_from_address(address),
                        :city    => address.city,
                        :zip     => address.zipcode)
